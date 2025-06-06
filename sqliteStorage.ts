@@ -440,6 +440,7 @@ export function createSqliteStorage(): StorageInterface {
             await database.runAsync('CREATE INDEX IF NOT EXISTS idx_entries_order ON entries(order_id)');
             await database.runAsync('CREATE INDEX IF NOT EXISTS idx_entries_customer ON entries(customer)');
             await database.runAsync('CREATE INDEX IF NOT EXISTS idx_entries_txn_type ON entries(txn_type)');
+            await database.runAsync('CREATE INDEX IF NOT EXISTS idx_entries_customer_txn_type ON entries(customer, txn_type)');
             console.log('Created indices for columns');
           } else {
             console.log('Entries table does not exist yet, will be created with all columns');
@@ -630,6 +631,27 @@ export function createSqliteStorage(): StorageInterface {
             `;
             await database.runAsync(createOrderIdIndex);
             console.log('Order ID index created');
+            
+            // Customer index
+            const createCustomerIndex = `
+              CREATE INDEX IF NOT EXISTS idx_entries_customer ON entries(customer)
+            `;
+            await database.runAsync(createCustomerIndex);
+            console.log('Customer index created');
+            
+            // Transaction type index
+            const createTxnTypeIndex = `
+              CREATE INDEX IF NOT EXISTS idx_entries_txn_type ON entries(txn_type)
+            `;
+            await database.runAsync(createTxnTypeIndex);
+            console.log('Transaction type index created');
+            
+            // Composite customer + transaction type index for optimal credit queries
+            const createCustomerTxnTypeIndex = `
+              CREATE INDEX IF NOT EXISTS idx_entries_customer_txn_type ON entries(customer, txn_type)
+            `;
+            await database.runAsync(createCustomerTxnTypeIndex);
+            console.log('Customer + transaction type composite index created');
           } catch (indexError) {
             // If indices fail, it's not critical - the app can still work without them
             console.warn('Failed to create indices, but continuing anyway:', indexError);
@@ -1600,6 +1622,7 @@ export async function getEntriesWithOrderInfoByDateAndTimeRange(
     FROM entries e
     LEFT JOIN orders o ON e.order_id = o.order_id
     WHERE date(e.transaction_date) = date(?)
+    AND (e.txn_type IS NULL OR e.txn_type = '' OR e.txn_type = 'sale' OR e.txn_type = 'credit_paid')
   `;
   const params: any[] = [date.toISOString()];
   
@@ -1668,6 +1691,7 @@ export async function discoverNewItems(
           AND e.item IS NOT NULL 
           AND TRIM(e.item) != ''
           AND e.price > 0
+          AND TRIM(e.item) NOT LIKE 'paid-%'
       )
       SELECT 
         item,
@@ -2555,6 +2579,114 @@ export async function getCustomerCreditHistory(customerName: string): Promise<En
 }
 
 /**
+ * Get all credit transactions (both sales and payments) across all customers
+ */
+export async function getAllCreditTransactions(limit?: number): Promise<Entry[]> {
+  const db = getDatabase();
+  
+  try {
+    let query = `
+      SELECT * FROM entries 
+      WHERE txn_type IN ('credit', 'credit_paid')
+      ORDER BY transaction_date DESC, created_at DESC
+    `;
+    
+    if (limit) {
+      query += ` LIMIT ${limit}`;
+    }
+    
+    const result = await db.getAllAsync<any>(query);
+    
+    return result.map(row => standaloneRowToEntry(row));
+  } catch (error) {
+    console.error('Error getting all credit transactions:', error);
+    return [];
+  }
+}
+
+/**
+ * Get individual credit transactions for a specific date (excluding those that form batches)
+ * This includes:
+ * 1. Transactions without batch_id
+ * 2. Transactions with batch_id but are alone on that specific date
+ */
+export async function getIndividualCreditTransactions(
+  date: Date,
+  customer?: string
+): Promise<Entry[]> {
+  const db = getDatabase();
+  
+  try {
+    let query = `
+      WITH batch_counts AS (
+        SELECT 
+          batch_id,
+          DATE(transaction_date) as trans_date,
+          COUNT(*) as count_per_date
+        FROM entries 
+        WHERE txn_type = 'credit'
+          AND batch_id IS NOT NULL 
+          AND batch_id != ''
+          AND DATE(transaction_date) = DATE(?)
+        GROUP BY batch_id, DATE(transaction_date)
+      )
+      SELECT e.* FROM entries e
+      WHERE e.txn_type = 'credit'
+        AND DATE(e.transaction_date) = DATE(?)
+        AND (
+          e.batch_id IS NULL 
+          OR e.batch_id = ''
+          OR (
+            e.batch_id IS NOT NULL 
+            AND e.batch_id != ''
+            AND EXISTS (
+              SELECT 1 FROM batch_counts bc 
+              WHERE bc.batch_id = e.batch_id 
+                AND bc.trans_date = DATE(e.transaction_date)
+                AND bc.count_per_date = 1
+            )
+          )
+        )
+    `;
+    
+    const params: any[] = [date.toISOString(), date.toISOString()];
+    
+    if (customer) {
+      query += ` AND e.customer = ?`;
+      params.push(customer);
+    }
+    
+    query += ` ORDER BY e.transaction_date DESC, e.created_at DESC`;
+    
+    const result = await db.getAllAsync<any>(query, params);
+    
+    return result.map(row => standaloneRowToEntry(row));
+  } catch (error) {
+    console.error('Error getting individual credit transactions:', error);
+    return [];
+  }
+}
+
+/**
+ * Delete a credit transaction by ID
+ */
+export async function deleteCreditTransaction(entryId: string): Promise<boolean> {
+  const db = getDatabase();
+  
+  try {
+    const result = await db.runAsync(`
+      DELETE FROM entries 
+      WHERE id = ? AND txn_type IN ('credit', 'credit_paid')
+    `, [entryId]);
+    
+    return result.changes > 0;
+  } catch (error) {
+    console.error('Error deleting credit transaction:', error);
+    throw error;
+  }
+}
+
+/**
  * Get unique customer names for autocomplete
  */
 export async function getUniqueCustomers(): Promise<string[]> {
@@ -2576,7 +2708,7 @@ export async function getUniqueCustomers(): Promise<string[]> {
 }
 
 /**
- * Create a credit sale entry
+ * Create a credit sale entry with enhanced validation and error handling
  */
 export async function createCreditSale(
   customerName: string,
@@ -2584,95 +2716,495 @@ export async function createCreditSale(
   qty: number,
   unit: string,
   price: number,
-  sourceText: string = ''
+  sourceText: string = '',
+  transactionDate?: string // Add optional transaction_date parameter
 ): Promise<string> {
   const db = getDatabase();
+  
+  // Enhanced validation
+  if (!customerName?.trim()) {
+    throw new Error('Customer name is required for credit sales');
+  }
+  
+  if (!item?.trim()) {
+    throw new Error('Item name is required for credit sales');
+  }
+  
+  if (!qty || qty <= 0) {
+    throw new Error('Quantity must be greater than 0');
+  }
+  
+  if (price < 0) {
+    throw new Error('Price cannot be negative');
+  }
   
   try {
     const entryId = uuid.v4().toString();
     const now = new Date().toISOString();
+    const transactionDateTime = transactionDate || now; // Use provided date or current time
     const total = qty * price;
     
-    await db.runAsync(`
-      INSERT INTO entries (
+    // Normalize customer name for consistency
+    const normalizedCustomerName = customerName.trim()
+      .split(' ')
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+      .join(' ');
+    
+    // Normalize item name
+    const normalizedItemName = item.trim()
+      .split(' ')
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+      .join(' ');
+    
+    await db.runAsync(
+      `INSERT INTO entries (
         id, item, qty, unit, price, total, type, 
-        created_at, transaction_date, source_text, 
-        is_final, user_id, version, confirmed, 
-        batch_id, order_id, customer, txn_type
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
+        transaction_date, source_text, created_at, is_final, 
+        user_id, version, confirmed, customer, txn_type
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
       entryId,
-      item,
+        normalizedItemName,
       qty,
-      unit,
+        unit || '',
       price,
       total,
-      'cash-in', // Credit sale is still income
-      now,
-      now,
+        'cash-in', // Credit sales increase balance (asset)
+        transactionDateTime, // Use the provided or current transaction_date
       sourceText,
-      1, // is_final = true
+        now, // created_at always uses current time
+        true,
       'default-user',
-      1, // version
-      1, // confirmed = true
-      null, // no batch_id
-      null, // no order_id
-      customerName,
+        1,
+        true,
+        normalizedCustomerName,
       'credit'
-    ]);
+      ]
+    );
     
     return entryId;
   } catch (error) {
-    console.error('Error creating credit sale:', error);
+    console.error('❌ Error creating credit sale:', error);
+    
+    // Provide more specific error messages based on the error type
+    if (error instanceof Error) {
+      if (error.message.includes('UNIQUE constraint failed')) {
+        throw new Error('A transaction with this ID already exists. Please try again.');
+      } else if (error.message.includes('NOT NULL constraint failed')) {
+        throw new Error('Required transaction data is missing. Please check all fields.');
+      } else if (error.message.includes('database')) {
+        throw new Error('Database error occurred. Please try again or restart the app.');
+      }
+    }
+    
+    throw new Error(`Failed to create credit sale: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
+
+/**
+ * Create a credit payment entry with enhanced validation and error handling
+ */
+export async function createCreditPayment(
+  customerName: string,
+  amount: number,
+  sourceText: string = '',
+  transactionDate?: string // Add optional transaction_date parameter
+): Promise<string> {
+  const db = getDatabase();
+  
+  // Enhanced validation
+  if (!customerName?.trim()) {
+    throw new Error('Customer name is required for credit payments');
+  }
+  
+  if (!amount || amount <= 0) {
+    throw new Error('Payment amount must be greater than 0');
+  }
+  
+  // Reasonable limits for payment amounts (adjust as needed)
+  if (amount > 1000000) {
+    throw new Error('Payment amount seems unusually large. Please verify the amount.');
+  }
+  
+  try {
+    const entryId = uuid.v4().toString();
+    const now = new Date().toISOString();
+    const transactionDateTime = transactionDate || now; // Use provided date or current time
+    
+    // Normalize customer name for consistency
+    const normalizedCustomerName = customerName.trim()
+      .split(' ')
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+      .join(' ');
+    
+    // Create proper item name format: paid-customer-ddmmyy
+    const today = new Date();
+    const day = String(today.getDate()).padStart(2, '0');
+    const month = String(today.getMonth() + 1).padStart(2, '0');
+    const year = String(today.getFullYear()).slice(-2);
+    const dateString = `${day}${month}${year}`;
+    const itemName = `paid-${normalizedCustomerName.toLowerCase().replace(/\s+/g, '')}-${dateString}`;
+    
+    await db.runAsync(
+      `INSERT INTO entries (
+        id, item, qty, unit, price, total, type, 
+        transaction_date, source_text, created_at, is_final, 
+        user_id, version, confirmed, customer, txn_type
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+      entryId,
+        itemName,
+        1,
+        'payment',
+        amount,
+        amount,
+        'cash-in', // Credit payments are cash inflow
+        transactionDateTime, // Use the provided or current transaction_date
+      sourceText,
+        now, // created_at always uses current time
+        true,
+      'default-user',
+        1,
+        true,
+        normalizedCustomerName,
+      'credit_paid'
+      ]
+    );
+    
+    return entryId;
+  } catch (error) {
+    console.error('❌ Error creating credit payment:', error);
+    
+    // Provide more specific error messages
+    if (error instanceof Error) {
+      if (error.message.includes('UNIQUE constraint failed')) {
+        throw new Error('A payment with this ID already exists. Please try again.');
+      } else if (error.message.includes('NOT NULL constraint failed')) {
+        throw new Error('Required payment data is missing. Please check all fields.');
+      } else if (error.message.includes('database')) {
+        throw new Error('Database error occurred. Please try again or restart the app.');
+      }
+    }
+    
+    throw new Error(`Failed to create credit payment: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
+
+/**
+ * Create a batch of credit sale entries with enhanced validation and transaction safety
+ */
+export async function createCreditSaleBatch(
+  customerName: string,
+  items: Array<{
+    item: string;
+    qty: number;
+    unit: string;
+    price: number;
+    total: number;
+  }>,
+  sourceText: string = ''
+): Promise<string> {
+  const db = getDatabase();
+  
+  // Enhanced validation
+  if (!customerName?.trim()) {
+    throw new Error('Customer name is required for credit sales batch');
+  }
+  
+  if (!items || items.length === 0) {
+    throw new Error('At least one item is required for credit sales batch');
+  }
+  
+  // Validate each item
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    
+    if (!item.item?.trim()) {
+      throw new Error(`Item name is required for item ${i + 1}`);
+    }
+    
+    if (!item.qty || item.qty <= 0) {
+      throw new Error(`Quantity must be greater than 0 for item ${i + 1}: ${item.item}`);
+    }
+    
+    if (item.price < 0) {
+      throw new Error(`Price cannot be negative for item ${i + 1}: ${item.item}`);
+    }
+    
+    // Validate that total matches qty * price (with small tolerance for floating point errors)
+    const expectedTotal = item.qty * item.price;
+    if (Math.abs(item.total - expectedTotal) > 0.01) {
+      console.warn(`Total mismatch for ${item.item}: expected ${expectedTotal}, got ${item.total}. Correcting...`);
+      item.total = expectedTotal; // Auto-correct the total
+    }
+  }
+  
+  const batchId = uuid.v4().toString();
+  const now = new Date().toISOString();
+  
+  // Normalize customer name for consistency
+  const normalizedCustomerName = customerName.trim()
+    .split(' ')
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(' ');
+  
+  try {
+    // Use a transaction for atomic operation
+    await db.withTransactionAsync(async () => {
+      for (const item of items) {
+        const entryId = uuid.v4().toString();
+        
+        // Normalize item name
+        const normalizedItemName = item.item.trim()
+          .split(' ')
+          .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+          .join(' ');
+        
+        await db.runAsync(
+          `INSERT INTO entries (
+            id, item, qty, unit, price, total, type, 
+            transaction_date, source_text, created_at, is_final, 
+            user_id, version, confirmed, customer, txn_type, batch_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            entryId,
+            normalizedItemName,
+            item.qty,
+            item.unit || '',
+            item.price,
+            item.total,
+            'cash-in', // Credit sales increase balance (asset)
+            now,
+            sourceText,
+            now,
+            true,
+            'default-user',
+            1,
+            true,
+            normalizedCustomerName,
+            'credit',
+            batchId
+          ]
+        );
+      }
+    });
+    
+    const totalAmount = items.reduce((sum, item) => sum + item.total, 0);
+    
+    return batchId;
+    
+  } catch (error) {
+    console.error('❌ Error creating credit sales batch:', error);
+    
+    // Provide more specific error messages
+    if (error instanceof Error) {
+      if (error.message.includes('UNIQUE constraint failed')) {
+        throw new Error('A transaction with this ID already exists. Please try again.');
+      } else if (error.message.includes('NOT NULL constraint failed')) {
+        throw new Error('Required transaction data is missing. Please check all fields.');
+      } else if (error.message.includes('database')) {
+        throw new Error('Database error occurred. Please try again or restart the app.');
+      }
+    }
+    
+    throw new Error(`Failed to create credit sales batch: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
+
+/**
+ * Get credit batches for display (grouped multi-item transactions by batch_id AND date)
+ * Items with same batch_id but different dates will be grouped separately per date
+ * Only shows as batch if 2+ items exist with same batch_id on the same date
+ */
+export async function getCreditBatches(
+  startDate?: Date,
+  endDate?: Date,
+  customer?: string
+): Promise<Array<{
+  batch_id: string;
+  customer: string;
+  total_amount: number;
+  item_count: number;
+  transaction_date: string;
+  source_text: string;
+}>> {
+  const db = getDatabase();
+  
+  try {
+    let query = `
+      SELECT 
+        batch_id,
+        customer,
+        SUM(total) as total_amount,
+        COUNT(*) as item_count,
+        MAX(transaction_date) as transaction_date,
+        MAX(source_text) as source_text
+      FROM entries 
+      WHERE txn_type = 'credit' 
+        AND batch_id IS NOT NULL 
+        AND batch_id != ''
+    `;
+    
+    const params: any[] = [];
+    
+    if (startDate) {
+      query += ` AND date(transaction_date) >= date(?)`;
+      params.push(startDate.toISOString());
+    }
+    
+    if (endDate) {
+      query += ` AND date(transaction_date) <= date(?)`;
+      params.push(endDate.toISOString());
+    }
+    
+    if (customer) {
+      query += ` AND customer = ?`;
+      params.push(customer);
+    }
+    
+    query += `
+      GROUP BY batch_id, customer, DATE(transaction_date)
+      HAVING COUNT(*) > 1
+      ORDER BY transaction_date DESC, batch_id DESC
+    `;
+    
+    const result = await db.getAllAsync<any>(query, params);
+    
+    return result.map(row => ({
+      batch_id: row.batch_id,
+      customer: row.customer || '',
+      total_amount: row.total_amount || 0,
+      item_count: row.item_count || 0,
+      transaction_date: row.transaction_date,
+      source_text: row.source_text || ''
+    }));
+  } catch (error) {
+    console.error('Error getting credit batches:', error);
+    return [];
+  }
+}
+
+/**
+ * Get total credit balance (outstanding - paid)
+ */
+export async function getTotalCreditBalance(): Promise<number> {
+  try {
+    const db = getDatabase();
+    
+    // Get total credit sales amount
+    const creditSalesResult = await db.getFirstAsync<{total_credit: number}>(
+      `SELECT COALESCE(SUM(total), 0) as total_credit 
+       FROM entries 
+       WHERE txn_type = 'credit'`
+    );
+    const totalCredit = creditSalesResult?.total_credit || 0;
+    
+    // Get total credit payments amount
+    const creditPaymentsResult = await db.getFirstAsync<{total_paid: number}>(
+      `SELECT COALESCE(SUM(total), 0) as total_paid 
+       FROM entries 
+       WHERE txn_type = 'credit_paid'`
+    );
+    const totalPaid = creditPaymentsResult?.total_paid || 0;
+    
+    // Net outstanding = credit sales - credit payments
+    return totalCredit - totalPaid;
+  } catch (error) {
+    console.error('Error calculating total credit balance:', error);
     throw error;
   }
 }
 
 /**
- * Create a credit payment entry
+ * Update customer name for all transactions in a batch
  */
-export async function createCreditPayment(
-  customerName: string,
-  amount: number,
-  sourceText: string = ''
-): Promise<string> {
+export async function updateBatchCustomer(
+  batchId: string,
+  newCustomerName: string
+): Promise<void> {
+  const db = getDatabase();
+  
+  if (!batchId?.trim()) {
+    throw new Error('Batch ID is required');
+  }
+  
+  if (!newCustomerName?.trim()) {
+    throw new Error('Customer name is required');
+  }
+  
+  // Normalize customer name for consistency
+  const normalizedCustomerName = newCustomerName.trim()
+    .split(' ')
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(' ');
+  
+  try {
+    // Update all entries with the given batch_id
+    const result = await db.runAsync(
+      `UPDATE entries 
+       SET customer = ? 
+       WHERE batch_id = ? AND txn_type = 'credit'`,
+      [normalizedCustomerName, batchId]
+    );
+    
+    if (result.changes === 0) {
+      throw new Error('No transactions found for this batch ID');
+    }   
+    
+    
+  } catch (error) {
+    console.error('❌ Error updating batch customer:', error);
+    
+    if (error instanceof Error) {
+      if (error.message.includes('No transactions found')) {
+        throw error;
+      } else if (error.message.includes('database')) {
+        throw new Error('Database error occurred. Please try again or restart the app.');
+      }
+    }
+    
+    throw new Error(`Failed to update batch customer: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
+
+/**
+ * Get all credit transactions (credit + credit_paid) within a date range - OPTIMIZED
+ */
+export async function getCreditTransactionsByDateRange(
+  startDate: Date,
+  endDate: Date,
+  limit?: number
+): Promise<Entry[]> {
   const db = getDatabase();
   
   try {
-    const entryId = uuid.v4().toString();
-    const now = new Date().toISOString();
+    // Format dates for SQL comparison
+    const startDateTime = new Date(startDate);
+    startDateTime.setHours(0, 0, 0, 0);
     
-    await db.runAsync(`
-      INSERT INTO entries (
-        id, item, qty, unit, price, total, type, 
-        created_at, transaction_date, source_text, 
-        is_final, user_id, version, confirmed, 
-        batch_id, order_id, customer, txn_type
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      entryId,
-      'Payment', // Generic item name for payments
-      1, // qty = 1
-      'payment', // unit = payment
-      amount, // price = amount
-      amount, // total = amount
-      'cash-in', // Payment received is income
-      now,
-      now,
-      sourceText,
-      1, // is_final = true
-      'default-user',
-      1, // version
-      1, // confirmed = true
-      null, // no batch_id
-      null, // no order_id
-      customerName,
-      'credit_paid'
+    const endDateTime = new Date(endDate);  
+    endDateTime.setHours(23, 59, 59, 999);
+    
+    let query = `
+      SELECT * FROM entries 
+      WHERE txn_type IN ('credit', 'credit_paid')
+        AND transaction_date >= ?
+        AND transaction_date <= ?
+      ORDER BY transaction_date DESC, created_at DESC
+    `;
+    
+    if (limit) {
+      query += ` LIMIT ${limit}`;
+    }
+    
+    const result = await db.getAllAsync<any>(query, [
+      startDateTime.toISOString(),
+      endDateTime.toISOString()
     ]);
     
-    return entryId;
+    return result.map(row => standaloneRowToEntry(row));
   } catch (error) {
-    console.error('Error creating credit payment:', error);
-    throw error;
+    console.error('Error getting credit transactions by date range:', error);
+    return [];
   }
 }

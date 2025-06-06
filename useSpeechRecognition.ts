@@ -247,7 +247,23 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}):
     }
     
     try {
-      // IMPORTANT: Always check for price commands FIRST regardless of quick mode
+      // IMPORTANT: Check for credit commands FIRST to prevent conflicts
+      // Credit commands can contain "Rs" which would be detected as price commands
+      if (isCreditCommand(finalTranscript)) {
+        const parsedResult = await parseCreditCommand(finalTranscript);
+        if (parsedResult.type === 'credit' && onTranscriptParsed && parsedResult.credit) {
+          onTranscriptParsed({
+            type: 'credit',
+            credit: parsedResult.credit,
+            source_text: finalTranscript,
+            forceReview: parsedResult.forceReview
+          }, parsedResult.warnings);
+        }
+        resetTranscript();
+        return;
+      }
+      
+      // IMPORTANT: Always check for price commands AFTER credit commands
       // This ensures consistent behavior between quick mode ON and OFF
       const priceUpdates = parsePriceSentence(finalTranscript);
       if (priceUpdates.length > 0) {
@@ -276,7 +292,7 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}):
       }
       
       // Use enhanced parsing to detect command type for non-price commands
-      const parsedResult: ParsedResult = parseEnhanced(finalTranscript);
+      const parsedResult: ParsedResult = await parseEnhanced(finalTranscript);
       
       // Handle different types of commands
       if (parsedResult.type === 'price') {
@@ -398,20 +414,9 @@ export function useSpeechRecognition(options: UseSpeechRecognitionOptions = {}):
       }
       
       if (parsedResult.type === 'credit') {
-        // Credit command - new functionality
-        
-        // Credit commands now respect quick mode setting like other transactions
-        if (onTranscriptParsed && parsedResult.credit) {
-          onTranscriptParsed({
-            type: 'credit',
-            credit: parsedResult.credit,
-            source_text: finalTranscript
-          }, parsedResult.warnings);
-        } else {
-          console.warn('No handler for credit command');
-          showToast('💳 Credit detected but no handler available');
-        }
-        
+        // Credit command - already handled above in the dedicated credit section
+        // This shouldn't happen since we check isCreditCommand first, but keeping for safety
+        console.warn('Credit command detected in secondary parsing - this should not happen');
         resetTranscript();
         return;
       }

@@ -20,7 +20,7 @@ import { CreditReviewCard } from '../components/CreditReviewCard';
 import { getStorage } from '../utils/storage';
 import { addEntry, updateEntry, clearCurrentEntry, addEntriesBatch } from '../state/actions';
 import { PricesScreen } from './PricesScreen';
-import { upsertPrice, createOrder, lookupPrice, createCreditSale, createCreditPayment } from '../utils/sqliteStorage';
+import { upsertPrice, createOrder, lookupPrice, createCreditSale, createCreditPayment, createCreditSaleBatch, saveSinglePrice } from '../utils/sqliteStorage';
 import { showSnackbar, Snackbar } from '../components/Snackbar';
 
 // Add navigation type
@@ -161,12 +161,12 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation }) => {
     }
     
     if (entry.type === 'credit') {
-      // Handle credit transactions - respect quick mode setting
-      if (!settings.quickCapture) {
+      // Handle credit transactions - check forceReview flag for credit payments
+      if (!settings.quickCapture || entry.forceReview) {
         setCurrentCreditEntry(entry);
         setWarnings(warnings);
       } else {
-        // Quick mode ON - save credit transaction directly
+        // Quick mode ON and no forceReview - save credit transaction directly
         saveQuickCreditEntry(entry.credit, entry.source_text);
       }
       return;
@@ -407,17 +407,12 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation }) => {
       if (creditData.type === 'sale') {
         // Handle multi-item credit sales
         if (creditData.items && creditData.items.length > 0) {
-          // Multi-item credit sale
-          for (const item of creditData.items) {
-            await createCreditSale(
+          // Multi-item credit sale - use batch function to assign batch_id
+          await createCreditSaleBatch(
               creditData.customer,
-              item.item,
-              item.qty,
-              item.unit,
-              item.price,
+            creditData.items,
               currentCreditEntry.source_text || ''
             );
-          }
           showSnackbar(`✅ Credit sale recorded: ${creditData.items.length} items for ${creditData.customer}`, 'normal');
         } else {
           // Single item credit sale (backward compatibility)
@@ -458,17 +453,12 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation }) => {
       if (creditData.type === 'sale') {
         // Handle multi-item credit sales
         if (creditData.items && creditData.items.length > 0) {
-          // Multi-item credit sale
-          for (const item of creditData.items) {
-            await createCreditSale(
+          // Multi-item credit sale - use batch function to assign batch_id
+          await createCreditSaleBatch(
               creditData.customer,
-              item.item,
-              item.qty,
-              item.unit,
-              item.price,
+            creditData.items,
               sourceText || ''
             );
-          }
           showSnackbar(`✅ Credit sale: ${creditData.items.length} items for ${creditData.customer}`, 'normal');
         } else {
           // Single item credit sale (backward compatibility)

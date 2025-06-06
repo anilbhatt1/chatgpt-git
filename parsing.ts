@@ -39,6 +39,7 @@ export interface ParsedResult {
   };
   warnings: string[];
   source_text: string;
+  forceReview?: boolean; // Force showing review card even in quick mode
 }
 
 // Custom error class for parsing errors
@@ -147,31 +148,36 @@ export const isOrderCommand = (text: string): boolean => {
 
 /**
  * Detects if the text is about credit transactions
+ * Now only matches specific formats: "Credit Sales" or "Credit Paid"
  */
 export const isCreditCommand = (text: string): boolean => {
   if (!text) {
     return false;
   }
   
-  const lowerText = text.toLowerCase();
+  const trimmed = text.trim();
   
-  // Check for credit keywords
-  return lowerText.includes('credit sale') || lowerText.includes('credit paid');
+  // Check for exact credit command formats (case insensitive)
+  const startsWithCreditSales = /^credit\s+sales?\s+/i.test(trimmed);
+  const startsWithCreditPaid = /^credit\s+paid\s+/i.test(trimmed);
+  
+  return startsWithCreditSales || startsWithCreditPaid;
 };
 
 /**
  * Determines the type of credit command
+ * Now handles "Credit Sales" and "Credit Paid" specifically
  */
 export const getCreditCommandType = (text: string): 'sale' | 'payment' | null => {
   if (!text) {
     return null;
   }
   
-  const lowerText = text.toLowerCase();
+  const trimmed = text.trim();
   
-  if (lowerText.includes('credit sale')) {
+  if (/^credit\s+sales?\s+/i.test(trimmed)) {
     return 'sale';
-  } else if (lowerText.includes('credit paid')) {
+  } else if (/^credit\s+paid\s+/i.test(trimmed)) {
     return 'payment';
   }
   
@@ -221,32 +227,55 @@ export const extractCustomerName = (text: string): string | undefined => {
 };
 
 /**
- * Determines the transaction type from the text
+ * Determines the transaction type from the text with enhanced detection
  * Returns 'cash-in' for sales and 'cash-out' for purchases
  */
 export const determineTransactionType = (text: string): 'cash-in' | 'cash-out' => {
-  if (!text) {
+  if (!text || text.trim() === '') {
     return 'cash-in'; // Default type
   }
   
-  text = text.toLowerCase();
+  const lowerText = text.toLowerCase().trim();
   
-  // Default to 'cash-in' (most common)
-  let type: 'cash-in' | 'cash-out' = 'cash-in';
+  // Enhanced patterns for better detection
+  const cashInPatterns = [
+    /\b(sold|sell|selling|sale|sales)\b/,
+    /\b(income|earned|received|got)\b/,
+    /\b(customer|client)\s+(bought|purchased)/,
+    /\b(made|earned)\s+(money|profit|rs|rupees|₹)/
+  ];
   
-  // Check for cash-out keywords
-  const cashOutKeywords = TRANSACTION_TYPES['cash-out'];
-  if (cashOutKeywords.some(keyword => text.includes(keyword))) {
-    type = 'cash-out';
+  const cashOutPatterns = [
+    /\b(bought|buy|buying|purchased|purchase|purchasing)\b/,
+    /\b(spent|spend|spending|expense|expenses|cost|costs)\b/,
+    /\b(paid|pay|paying|payment)\s+(?!to\s+customer|from\s+customer)/,
+    /\b(invested|investment|supplies|supply)\b/,
+    /\b(bill|bills|invoice|invoices)\b/
+  ];
+  
+  // Check for explicit cash-out patterns first (they're usually more specific)
+  for (const pattern of cashOutPatterns) {
+    if (pattern.test(lowerText)) {
+      return 'cash-out';
+    }
   }
   
-  // But if there are explicit 'sold' or 'sell' keywords, override to cash-in
-  const soldKeywords = ['sold', 'sell', 'sale'];
-  if (soldKeywords.some(keyword => text.includes(keyword))) {
-    type = 'cash-in';
+  // Check for cash-in patterns
+  for (const pattern of cashInPatterns) {
+    if (pattern.test(lowerText)) {
+      return 'cash-in';
+    }
   }
   
-  return type;
+  // Fallback: If text contains price indicators but no clear direction,
+  // assume it's a sale (cash-in) as this is the most common use case
+  const hasPriceIndicators = /\b(rs\.?|rupees?|₹|\d+)/i.test(lowerText);
+  if (hasPriceIndicators) {
+    return 'cash-in';
+  }
+  
+  // Default to cash-in for sales-focused app
+  return 'cash-in';
 };
 
 /**
@@ -265,44 +294,69 @@ export const extractNumber = (text: string): number | null => {
 };
 
 /**
- * Extracts a currency value from text (looking for rupees, rs, ₹)
+ * Enhanced price extraction with better pattern matching
  */
 export const extractPrice = (text: string): number | null => {
   if (!text) {
     return null;
   }
   
-  // Look for price indicators
-  const priceRegex = /(?:rs\.?|rupees?|₹)\s*(\d+(\.\d+)?)/i;
-  const priceMatch = text.match(priceRegex);
+  // Enhanced price patterns for better detection
+  const pricePatterns = [
+    // "for Rs 20", "for rupees 30"
+    /(?:for\s+)?(?:rs\.?|rupees?|₹)\s*(\d+(?:\.\d{1,2})?)/i,
+    // "for 20 rupees", "20 rs"
+    /(?:for\s+)?(\d+(?:\.\d{1,2})?)\s*(?:rs\.?|rupees?|₹)/i,
+    // "at 20 each", "for 30 per piece"
+    /(?:at|for)\s*(\d+(?:\.\d{1,2})?)\s*(?:rs\.?|rupees?|₹)?\s*(?:each|per|a\s+piece)/i,
+    // "costs 25", "price 40"
+    /(?:costs?|price)\s*(?:rs\.?|rupees?|₹)?\s*(\d+(?:\.\d{1,2})?)/i,
+    // Fallback: standalone number near currency indicators
+    /(?:^|[^\d])(\d+(?:\.\d{1,2})?)(?:\s*(?:rs\.?|rupees?|₹))/i
+  ];
   
-  if (priceMatch && priceMatch[1]) {
-    return parseFloat(priceMatch[1]);
-  }
-  
-  // Look for "for X each" or "at X each" patterns
-  const eachRegex = /(?:for|at)\s*(\d+(\.\d+)?)\s*(?:rs\.?|rupees?|₹)?\s*(?:each|per|a piece)/i;
-  const eachMatch = text.match(eachRegex);
-  
-  if (eachMatch && eachMatch[1]) {
-    return parseFloat(eachMatch[1]);
+  for (const pattern of pricePatterns) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      const price = parseFloat(match[1]);
+      if (!isNaN(price) && price > 0) {
+        return price;
+      }
+    }
   }
   
   return null;
 };
 
 /**
- * Extract the quantity from the text
+ * Enhanced quantity extraction with better number detection
  */
 export const extractQuantity = (text: string): number => {
   if (!text) {
     return 1; // Default to 1
   }
   
-  const matches = text.match(/\d+(\.\d+)?/g);
-  if (!matches || matches.length === 0) return 1; // Default to 1
+  // Look for quantity patterns like "2 kg", "5 packets", "10 pieces"
+  const quantityPatterns = [
+    // Standard patterns: "2 kg rice", "5 packets biscuit"
+    /\b(\d+(?:\.\d+)?)\s*(?:kg|g|gram|grams|kilo|kilos|kilogram|kilograms|l|liter|liters|litre|litres|ml|packet|packets|pack|packs|piece|pieces|pc|pcs|box|boxes|bottle|bottles|can|cans|bag|bags|dozen|dozens)\b/i,
+    // Standalone numbers at the beginning
+    /^\s*(\d+(?:\.\d+)?)\b/,
+    // Numbers followed by "of"
+    /\b(\d+(?:\.\d+)?)\s+of\b/i
+  ];
   
-  return parseFloat(matches[0]);
+  for (const pattern of quantityPatterns) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      const quantity = parseFloat(match[1]);
+      if (!isNaN(quantity) && quantity > 0) {
+        return quantity;
+      }
+    }
+  }
+  
+  return 1; // Default to 1 if no quantity found
 };
 
 /**
@@ -363,7 +417,7 @@ export const extractUnit = (text: string): string | null => {
 };
 
 /**
- * Attempts to identify the item name from the text
+ * Enhanced item extraction with better error handling and edge case support
  */
 export const extractItem = (text: string): string => {
   if (!text || text.trim() === '') {
@@ -387,38 +441,56 @@ export const extractItem = (text: string): string => {
     return specialBrand;
   }
   
+  const originalText = text;
   text = text.toLowerCase();
   
-  // Remove common transaction words and numbers
+  // Enhanced cleaning - remove more transaction words and patterns
   const cleanedText = text
-    .replace(/\b(sold|sell|sale|bought|buy|purchased|expense|spent)\b/gi, '')
-    .replace(/\d+(\.\d+)?/g, '')
-    .replace(/\b(rs\.?|rupees?|₹|each|per|for|at)\b/gi, '');
+    .replace(/\b(sold|sell|sale|bought|buy|purchased|expense|spent|income|earned)\b/gi, '')
+    .replace(/\b(credit|paid|payment|cash|money)\b/gi, '')
+    .replace(/\b(to|from|by|for|with|of|in|on|at|the|a|an)\b/gi, '')
+    .replace(/\d+(\.\d+)?/g, '') // Remove all numbers
+    .replace(/\b(rs\.?|rupees?|₹|each|per)\b/gi, '')
+    .replace(/[^\w\s]/g, ' ') // Replace punctuation with spaces
+    .replace(/\s+/g, ' ') // Normalize whitespace
+    .trim();
   
   // Remove known units
   let itemText = cleanedText;
   for (const unit of KNOWN_UNITS) {
-    itemText = itemText.replace(new RegExp(`\\b${unit}\\b`, 'gi'), '');
+    const regex = new RegExp(`\\b${unit}s?\\b`, 'gi'); // Include plurals
+    itemText = itemText.replace(regex, '');
   }
   
-  // Remove common prepositions like 'of'
-  itemText = itemText.replace(/\b(of|from|to|with)\b/gi, '');
-  
-  // Clean up extra spaces and punctuation
+  // Final cleanup
   itemText = itemText
     .replace(/\s+/g, ' ')
-    .replace(/[.,;:!?-]+/g, ' ')
     .trim();
   
-  // If we have a very short or empty string, return a generic item name
+  // Enhanced validation and fallback logic
   if (itemText.length < 2) {
+    // Try to extract meaningful words from original text
+    const words = originalText
+      .replace(/[^\w\s]/g, ' ')
+      .split(/\s+/)
+      .filter(word => 
+        word.length > 2 && 
+        !['sold', 'sell', 'sale', 'bought', 'buy', 'purchased', 'expense', 'spent', 'for', 'from', 'the'].includes(word.toLowerCase()) &&
+        !/^\d+$/.test(word) &&
+        !KNOWN_UNITS.includes(word.toLowerCase())
+      );
+    
+    if (words.length > 0) {
+      itemText = words.join(' ');
+    } else {
     throw new ParsingError('Unable to identify item name from input', 'UNKNOWN_ITEM');
+    }
   }
   
-  // Capitalize first letter of each word
+  // Capitalize first letter of each word for consistency
   return itemText
     .split(' ')
-    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
     .join(' ');
 };
 
@@ -634,7 +706,7 @@ export function parseOrderCommand(text: string): ParsedResult {
 /**
  * Enhanced parsing function that can detect orders, transactions, or price updates
  */
-export function parseEnhanced(text: string): ParsedResult {
+export async function parseEnhanced(text: string): Promise<ParsedResult> {
   if (!text || text.trim() === '') {
     return {
       type: 'transaction',
@@ -645,6 +717,17 @@ export function parseEnhanced(text: string): ParsedResult {
   
   const lowerText = text.toLowerCase();
   
+  // Check if this is a credit command FIRST (before price parsing)
+  // This prevents conflicts where credit commands contain "Rs" and get detected as price commands
+  if (isCreditCommand(text)) {
+    return await parseCreditCommand(text);
+  }
+  
+  // Check if this is an order command
+  if (isOrderCommand(text)) {
+    return parseOrderCommand(text);
+  }
+  
   // Check if this is a price update command
   const priceUpdates = parsePriceSentence(text);
   if (priceUpdates.length > 0) {
@@ -654,16 +737,6 @@ export function parseEnhanced(text: string): ParsedResult {
       warnings: [],
       source_text: text
     };
-  }
-  
-  // Check if this is an order command
-  if (isOrderCommand(text)) {
-    return parseOrderCommand(text);
-  }
-  
-  // Check if this is a credit command
-  if (isCreditCommand(text)) {
-    return parseCreditCommand(text);
   }
   
   // Default to transaction parsing
@@ -819,6 +892,12 @@ export function parsePriceSentence(sentence: string): Array<{ item: string; pric
     return [];
   }
 
+  // IMPORTANT: Don't parse credit commands as price commands
+  // This prevents conflicts where credit commands containing "Rs" get detected as prices
+  if (isCreditCommand(sentence)) {
+    return [];
+  }
+
   // Check if this is a price-related command
   const priceKeywords = ['price', 'cost', 'rate', 'rupees', 'rs', '₹'];
   const hasPriceKeyword = priceKeywords.some(keyword => 
@@ -950,7 +1029,7 @@ export async function parseSentenceWithPriceLookup(text: string): Promise<{ entr
 /**
  * Parse credit commands like "credit sale 10 kg rice for Priya" or "credit paid Priya 500"
  */
-export function parseCreditCommand(text: string): ParsedResult {
+export async function parseCreditCommand(text: string): Promise<ParsedResult> {
   const warnings: string[] = [];
   const source_text = text;
   
@@ -963,6 +1042,7 @@ export function parseCreditCommand(text: string): ParsedResult {
   }
   
   const creditType = getCreditCommandType(text);
+  
   if (!creditType) {
     return {
       type: 'transaction',
@@ -973,7 +1053,7 @@ export function parseCreditCommand(text: string): ParsedResult {
   
   try {
     if (creditType === 'sale') {
-      return parseCreditSale(text, warnings, source_text);
+      return await parseCreditSale(text, warnings, source_text);
     } else if (creditType === 'payment') {
       return parseCreditPayment(text, warnings, source_text);
     }
@@ -989,25 +1069,30 @@ export function parseCreditCommand(text: string): ParsedResult {
 }
 
 /**
- * Parse credit sale command: "credit sale 10 kg rice for Priya" or "credit sale 2 kg rice and 7 kg wheat for Anil"
+ * Parse credit sale command with new formats:
+ * Single: "Credit Sales 1 kg of Rice for Rs 20 for Priya" | "Credit Sales 1 kg of Rice for Rs 20" | "Credit Sales 1 kg of Rice" | "Credit Sales 1 kg of Rice for Priya"
+ * Multi: "Credit Sales 1 kg of Rice for Rs 20 and 1 kg of Wheat and 1 biscuit for Priya" | "Credit Sales 1 kg of Rice for Rs 20 and 1 kg Wheat and 1 biscuit" | etc.
  */
-function parseCreditSale(text: string, warnings: string[], source_text: string): ParsedResult {
-  // Remove "credit sale" from the beginning
-  const cleanText = text.replace(/^credit\s+sale\s+/i, '').trim();
+async function parseCreditSale(text: string, warnings: string[], source_text: string): Promise<ParsedResult> {
+  // Remove "Credit Sales" or "Credit Sale" from the beginning
+  const cleanText = text.replace(/^credit\s+sales?\s+/i, '').trim();
   
   // Extract customer name (should be at the end after "for")
   const customer = extractCustomerName(text);
-  if (!customer) {
-    warnings.push('Could not extract customer name from credit sale');
-    return { type: 'transaction', warnings, source_text };
-  }
   
   // Remove customer part from text to parse item details
-  const itemText = cleanText.replace(/\s+for\s+.+$/i, '').trim();
+  // Be more specific - only remove the final "for [customer]" part
+  let itemText = cleanText;
+  if (customer) {
+    const customerPattern = new RegExp(`\\s+for\\s+${customer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i');
+    itemText = itemText.replace(customerPattern, '').trim();
+  }
   
-  // Parse the item details using existing parsing logic
+  // Parse the item details using enhanced parsing with price lookup
   try {
-    const entries = parseSentence(itemText);
+    const { entries, warnings: parseWarnings } = await parseSentenceWithPriceLookup(itemText);
+    warnings.push(...parseWarnings);
+    
     if (entries.length === 0) {
       warnings.push('Could not parse item details from credit sale');
       return { type: 'transaction', warnings, source_text };
@@ -1030,7 +1115,7 @@ function parseCreditSale(text: string, warnings: string[], source_text: string):
         type: 'credit',
         credit: {
           type: 'sale',
-          customer,
+          customer: customer || 'Walk-in', // Default to Walk-in if no customer
           items, // Array of items for multi-item support
           amount: totalAmount
         },
@@ -1038,14 +1123,14 @@ function parseCreditSale(text: string, warnings: string[], source_text: string):
         source_text
       };
     } else {
-      // Single item credit sale (backward compatibility)
+      // Single item credit sale
       const entry = entries[0];
       
       return {
         type: 'credit',
         credit: {
           type: 'sale',
-          customer,
+          customer: customer || 'Walk-in', // Default to Walk-in if no customer
           item: entry.item || '',
           qty: entry.qty || 1,
           unit: entry.unit || '',
@@ -1063,55 +1148,65 @@ function parseCreditSale(text: string, warnings: string[], source_text: string):
 }
 
 /**
- * Parse credit payment command: "credit paid Priya 500" or "credit paid 500 to Priya"
+ * Parse credit payment command with new formats:
+ * "Credit Paid Rs 500 by Priya" | "Credit Paid Rs 500 from Priya" | "Credit Paid Rs 500 for Priya" | "Credit Paid Rs 500."
+ * Credit Paid transactions always require review (no quick mode)
  */
 function parseCreditPayment(text: string, warnings: string[], source_text: string): ParsedResult {
-  // Remove "credit paid" from the beginning
+  // Remove "Credit Paid" from the beginning
   const cleanText = text.replace(/^credit\s+paid\s+/i, '').trim();
   
-  // Try different patterns for credit payment
-  // Pattern 1: "credit paid Priya 500"
-  const pattern1 = cleanText.match(/^([a-zA-Z][a-zA-Z\s]*?)\s+(\d+(?:\.\d+)?)$/);
+  // Extract amount first - look for Rs/rupees/₹ patterns
+  let amount = 0;
+  let customerName = '';
+  
+  // Pattern 1: "Rs 500 by/from/for Priya"
+  const pattern1 = cleanText.match(/(?:rs\.?|rupees?|₹)\s*(\d+(?:\.\d+)?)\s+(?:by|from|for)\s+([a-zA-Z][a-zA-Z\s]*?)$/i);
   if (pattern1) {
-    const customerName = pattern1[1].trim();
-    const amount = parseFloat(pattern1[2]);
-    
-    return {
-      type: 'credit',
-      credit: {
-        type: 'payment',
-        customer: customerName
-          .split(' ')
-          .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
-          .join(' '),
-        amount
-      },
-      warnings,
-      source_text
-    };
+    amount = parseFloat(pattern1[1]);
+    customerName = pattern1[2].trim();
+  } else {
+    // Pattern 2: "500 by/from/for Priya" (without Rs prefix)
+    const pattern2 = cleanText.match(/^(\d+(?:\.\d+)?)\s+(?:by|from|for)\s+([a-zA-Z][a-zA-Z\s]*?)$/i);
+    if (pattern2) {
+      amount = parseFloat(pattern2[1]);
+      customerName = pattern2[2].trim();
+    } else {
+      // Pattern 3: "Rs 500" or "500" (no customer specified)
+      const pattern3 = cleanText.match(/(?:rs\.?|rupees?|₹)?\s*(\d+(?:\.\d+)?)\.?$/i);
+      if (pattern3) {
+        amount = parseFloat(pattern3[1]);
+        customerName = ''; // No customer specified
+      } else {
+        warnings.push('Could not parse credit payment amount');
+        return { type: 'transaction', warnings, source_text };
+      }
+    }
   }
   
-  // Pattern 2: "credit paid 500 to Priya" or "credit paid 500 for Priya"
-  const pattern2 = cleanText.match(/^(\d+(?:\.\d+)?)\s+(?:to|for)\s+([a-zA-Z][a-zA-Z\s]*?)$/);
-  if (pattern2) {
-    const amount = parseFloat(pattern2[1]);
-    const customerName = pattern2[2].trim();
-    
-    return {
-      type: 'credit',
-      credit: {
-        type: 'payment',
-        customer: customerName
-          .split(' ')
-          .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
-          .join(' '),
-        amount
-      },
-      warnings,
-      source_text
-    };
+  // Validate amount
+  if (amount <= 0) {
+    warnings.push('Credit payment amount must be greater than 0');
+    return { type: 'transaction', warnings, source_text };
   }
   
-  warnings.push('Could not parse credit payment command format');
-  return { type: 'transaction', warnings, source_text };
+  // Format customer name properly
+  const formattedCustomer = customerName ? 
+    customerName
+      .split(' ')
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+      .join(' ') 
+    : '';
+  
+  return {
+    type: 'credit',
+    credit: {
+      type: 'payment',
+      customer: formattedCustomer || 'Walk-in', // Default to Walk-in if no customer
+      amount
+    },
+    warnings,
+    source_text,
+    forceReview: true // Always show review card for credit payments
+  };
 } 
